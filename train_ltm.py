@@ -3,6 +3,7 @@ Main training script for Latent Thought Language Model
 """
 import math
 import os
+import sys
 import time
 from contextlib import nullcontext
 from functools import partial
@@ -18,11 +19,30 @@ from owt import Task
 
 def main():
     """Main training function."""
-    
+
+    # -------------------------------------------------------------------------
+    # CLI config overrides: python train_ltm.py key1=val1 key2=val2 ...
+    # -------------------------------------------------------------------------
+    for arg in sys.argv[1:]:
+        if '=' not in arg:
+            continue
+        key, val = arg.split('=', 1)
+        if not hasattr(config, key):
+            raise ValueError(f"Unknown config key: {key}")
+        old_val = getattr(config, key)
+        if isinstance(old_val, bool):
+            setattr(config, key, val.lower() in ('true', '1', 'yes'))
+        elif isinstance(old_val, int):
+            setattr(config, key, int(val))
+        elif isinstance(old_val, float):
+            setattr(config, key, float(val))
+        else:
+            setattr(config, key, val)
+
     # -----------------------------------------------------------------------------
     # Distributed Training Setup
     # -----------------------------------------------------------------------------
-    
+
     # Check if this is a distributed data parallel (DDP) run
     ddp = int(os.environ.get("RANK", -1)) != -1
     print(f"Using DDP for training: {ddp}")
@@ -63,7 +83,18 @@ def main():
     
     # Create output directories on the master process
     if master_process:
-        os.makedirs(config.out_dir, exist_ok=True)    
+        os.makedirs(config.out_dir, exist_ok=True)
+
+    # Weights & Biases setup
+    if config.wandb_log and master_process:
+        import wandb
+        wandb.init(
+            project=config.wandb_project,
+            name=config.wandb_run_name or None,
+            group=config.wandb_group or None,
+            config=config.get_config_dict(),
+        )
+
     # -----------------------------------------------------------------------------
     # Initialization and Setup
     # -----------------------------------------------------------------------------
@@ -127,6 +158,8 @@ def main():
         use_z_pos_emb=True,  # Use positional embeddings for latent variables
     )
     
+    checkpoint = None  # Will be set if resuming from a checkpoint
+
     if config.init_from == "scratch":
         # Initialize a new model from scratch
         print("Initializing a new model from scratch")
@@ -180,55 +213,91 @@ def main():
     # Load optimizer state if resuming from checkpoint
     if config.init_from == "resume" and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
+    _resume_checkpoint = checkpoint  # Keep reference for inference module restore
     checkpoint = None  # Free up memory
     
+    # -----------------------------------------------------------------------------
+    # Model and Posterior Optimizer Setup
+    # -----------------------------------------------------------------------------
+
+    print(f"Training configuration: steps={config.num_steps}, layers={config.n_layers}, "
+          f"z_len={config.max_z_len}, dim={config.dim}, heads={config.n_heads}")
+
+    # Create posterior optimizers BEFORE DDP wrap so we can register
+    # learnable inference modules on the model for gradient sync.
+    raw_model = model
+    
+    # Shared kwargs for posterior inference strategies
+    inference_kwargs = dict(
+        num_steps=config.num_steps,
+        max_z_len=config.max_z_len,
+        z_dim=config.z_dim,
+        lr=config.fast_lr,
+        meta_hidden_dim=getattr(config, 'meta_hidden_dim', 128),
+        meta_bptt_depth=getattr(config, 'meta_bptt_depth', 4),
+        delta_alpha=getattr(config, 'delta_alpha', 0.9),
+        precond_type=getattr(config, 'precond_type', 'learned'),
+        precond_rank=getattr(config, 'precond_rank', 32),
+        precond_beta=getattr(config, 'precond_beta', 0.9),
+        langevin_gamma=getattr(config, 'langevin_gamma', 0.1),
+        langevin_sigma=getattr(config, 'langevin_sigma', 0.01),
+        langevin_learn_schedule=getattr(config, 'langevin_learn_schedule', False),
+    )
+
+    # Initialize posterior optimizers for training and evaluation
+    posterior_optimizer = PosteriorOptimizer(
+        model=raw_model,
+        inference_method=config.inference_method,
+        eval_mode=False,
+        **inference_kwargs,
+    )
+
+    posterior_optimizer_test = PosteriorOptimizer(
+        model=raw_model,
+        inference_method=config.inference_method,
+        eval_mode=True,
+        **inference_kwargs,
+    )
+
+    # Restore inference module state if resuming from checkpoint
+    if config.init_from == "resume" and _resume_checkpoint is not None:
+        inf_state = _resume_checkpoint.get("inference_module_state")
+        if inf_state:
+            inf_params = dict(posterior_optimizer.get_learnable_parameters())
+            for name, data in inf_state.items():
+                if name in inf_params:
+                    inf_params[name].data.copy_(data)
+            print("Restored inference module state from checkpoint")
+        _resume_checkpoint = None
+
+    # Wire learnable inference parameters into the outer optimizer
+    inference_params = posterior_optimizer.get_learnable_parameters()
+    if inference_params:
+        optimizer.add_param_group({
+            "params": [p for _, p in inference_params],
+            "weight_decay": 0.0,
+            "lr": config.learning_rate,
+        })
+        total_inf_params = sum(p.numel() for _, p in inference_params)
+        print(f"Added {len(inference_params)} inference parameters "
+              f"({total_inf_params:,} total) to outer optimizer")
+
+    # Register learnable inference modules on the model for DDP gradient sync
+    for name, module in posterior_optimizer.get_learnable_modules():
+        raw_model.register_inference_module(name, module)
+
     # Compile model for performance if enabled (requires PyTorch 2.0+)
     if config.compile:
         print("Compiling the model... (takes a ~minute)")
         unoptimized_model = model
         model = torch.compile(model)
-    
-    # -----------------------------------------------------------------------------
-    # Distributed Training Wrap-up
-    # -----------------------------------------------------------------------------
-    
+
     # Wrap model in DDP container for distributed training
     if ddp:
-        # Ignore the `freqs_cis` buffer for DDP broadcasting (NCCL doesn't support ComplexFloat)
         prefix = "_orig_mod." if config.compile else ""
         model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
         model = DDP(model, device_ids=[ddp_local_rank])
-    
-    # -----------------------------------------------------------------------------
-    # Model and Posterior Optimizer Setup
-    # -----------------------------------------------------------------------------
-    
-    print(f"Training configuration: steps={config.num_steps}, layers={config.n_layers}, "
-          f"z_len={config.max_z_len}, dim={config.dim}, heads={config.n_heads}")
-    
-    # Get raw model by unwrapping DDP container if needed
-    raw_model = model.module if ddp else model
-    
-    # Initialize posterior optimizers for training and evaluation
-    posterior_optimizer = PosteriorOptimizer(
-        model=raw_model, 
-        inference_method=config.inference_method, 
-        num_steps=config.num_steps, 
-        max_z_len=config.max_z_len, 
-        z_dim=config.z_dim, 
-        lr=config.fast_lr, 
-        eval_mode=False
-    )
-    
-    posterior_optimizer_test = PosteriorOptimizer(
-        model=raw_model, 
-        inference_method=config.inference_method, 
-        num_steps=config.num_steps, 
-        max_z_len=config.max_z_len, 
-        z_dim=config.z_dim, 
-        lr=config.fast_lr, 
-        eval_mode=True
-    )
+        raw_model = model.module
     
     # -----------------------------------------------------------------------------
     # Training Utilities
@@ -336,7 +405,14 @@ def main():
         if iter_num % config.eval_interval == 0 and master_process:
             losses, ppl_out, kl_out = estimate_loss(current_lr)
             print(f"Step {iter_num}: val loss {losses['val']:.4f}, val PPL {ppl_out['val']:.4f}, val KL {kl_out['val']:.4f}")
-    
+
+            if config.wandb_log:
+                wandb.log({
+                    "val/loss": losses["val"].item(),
+                    "val/ppl": ppl_out["val"].item(),
+                    "val/kl": kl_out["val"].item(),
+                }, step=iter_num)
+
             # Save checkpoint if validation loss improved or if always_save_checkpoint is True
             if losses["val"] < best_val_loss or config.always_save_checkpoint:
                 best_val_loss = losses["val"]
@@ -348,7 +424,11 @@ def main():
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
                         "config": config.get_config_dict(),
-                        'rng_state': torch.random.get_rng_state()
+                        'rng_state': torch.random.get_rng_state(),
+                        "inference_module_state": {
+                            name: param.data for name, param
+                            in posterior_optimizer.get_learnable_parameters()
+                        } if posterior_optimizer.get_learnable_parameters() else None,
                     }
                     ckpt_path = os.path.join(config.out_dir, f"ckpt_{iter_num}.pt")
                     print(f"Saving checkpoint to {ckpt_path}")
@@ -424,7 +504,18 @@ def main():
                 f"{iter_num} | loss {lossf:.4f} | ppl {ppl:.4f} | kl {kl:.4f} | "
                 f"lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
             )
-        
+
+            if config.wandb_log:
+                wandb.log({
+                    "train/loss": lossf,
+                    "train/ppl": ppl.item(),
+                    "train/kl": kl.item(),
+                    "lr": lr,
+                    "fast_lr": current_lr,
+                    "mfu": running_mfu * 100,
+                    "iter_time_ms": dt * 1000,
+                }, step=iter_num)
+
         # Update iteration counters
         iter_num += 1
         local_iter_num += 1
@@ -437,7 +528,10 @@ def main():
     # -----------------------------------------------------------------------------
     # Cleanup
     # -----------------------------------------------------------------------------
-    
+
+    if config.wandb_log and master_process:
+        wandb.finish()
+
     # Clean up distributed training resources
     if ddp:
         destroy_process_group()

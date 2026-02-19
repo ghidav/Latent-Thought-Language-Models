@@ -462,6 +462,10 @@ class LatentThoughtModel(nn.Module):
 
         return logits
 
+    def register_inference_module(self, name, module):
+        """Register a learnable inference module so DDP can sync its gradients."""
+        self.add_module(f"inference_{name}", module)
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}

@@ -50,6 +50,29 @@ max_z_len = n_layers * 8  # Maximum length of latent sequence
 z_dim = dim  # Dimension of latent variables
 
 # -----------------------------------------------------------------------------
+# Posterior inference optimizer settings
+# inference_method options: 'adamVI', 'meta_learned', 'delta_momentum',
+#                           'preconditioned_manifold', 'underdamped_langevin'
+# -----------------------------------------------------------------------------
+
+# Meta-Learned Deep Momentum (Strategy 2)
+meta_hidden_dim = 128  # Hidden dimension for the meta-optimizer MLP
+meta_bptt_depth = 4  # Truncated BPTT depth (graph retained for last N inner steps)
+
+# Delta Momentum (Strategy 3)
+delta_alpha = 0.9  # Learning rate for the delta-rule momentum update
+
+# Preconditioned Manifold (Strategy 4)
+precond_type = 'learned'  # 'learned' (outer-loop learnable) or 'shampoo' (algorithmic)
+precond_rank = 32  # Rank of the low-rank learned preconditioner
+precond_beta = 0.9  # EMA decay for Shampoo diagonal covariance estimate
+
+# Underdamped Langevin Dynamics (Strategy 5)
+langevin_gamma = 0.1  # Friction coefficient
+langevin_sigma = 0.01  # Temperature / noise scale
+langevin_learn_schedule = False  # Whether to learn per-step gamma/sigma in outer loop
+
+# -----------------------------------------------------------------------------
 # Optimizer settings
 # -----------------------------------------------------------------------------
 gradient_accumulation_steps = 8  # Number of steps to accumulate gradients (simulates larger batch)
@@ -72,6 +95,14 @@ min_lr = 4e-5  # Minimum learning rate (typically learning_rate/10)
 device = "cuda"  # Device to use: 'cpu', 'cuda', 'cuda:0', etc.
 dtype = "bfloat16"  # Data type: float32, bfloat16, or float16
 compile = False  # Whether to use PyTorch 2.0 compilation for speed
+
+# -----------------------------------------------------------------------------
+# Weights & Biases logging
+# -----------------------------------------------------------------------------
+wandb_log = False  # Set True to enable wandb logging
+wandb_project = "ltm-owt-sweep"  # wandb project name
+wandb_run_name = ""  # wandb run name (empty = auto-generated)
+wandb_group = ""  # wandb group name to link related sweep runs
 
 # Create a dictionary of all configuration parameters
 def get_config_dict():
