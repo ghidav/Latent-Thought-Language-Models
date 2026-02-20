@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=prepare_owt
 #SBATCH --time=02:00:00
-#SBATCH --mem=32G
-#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=32
 #SBATCH --output=prepare_owt_%j.log
 
 set -euo pipefail
 
 DATA_DIR="${DATA_CACHE_DIR:-/scratch_local/data_owt}"
 OUT_DIR="${DATA_DIR}/tok_gpt2"
-NUM_PROC="${SLURM_CPUS_PER_TASK:-8}"
+NUM_PROC="${SLURM_CPUS_PER_TASK:-32}"
 
 mkdir -p "$OUT_DIR"
 
@@ -30,14 +30,27 @@ dataset = load_dataset('openwebtext', trust_remote_code=True)
 
 split = dataset['train'].train_test_split(test_size=0.005, seed=42)
 
-def tokenize(example):
-    return {'tokens': tokenizer.encode(example['text'])}
+def tokenize_batch(examples):
+    return {'tokens': tokenizer(examples['text'])['input_ids']}
 
 for split_name, key in [('train', 'train'), ('val', 'test')]:
-    tokenized = split[key].map(tokenize, num_proc=num_proc, remove_columns=['text'], desc=f'Tokenizing {split_name}')
-    all_tokens = np.concatenate([np.array(t, dtype=np.uint16) for t in tokenized['tokens']])
-    all_tokens.tofile(os.path.join(out_dir, f'{split_name}.bin'))
-    print(f'{split_name}: {len(all_tokens)} tokens')
+    tokenized = split[key].map(
+        tokenize_batch,
+        batched=True,
+        batch_size=1000,
+        num_proc=num_proc,
+        remove_columns=['text'],
+        desc=f'Tokenizing {split_name}',
+    )
+    # Write incrementally instead of concatenating everything in memory
+    out_path = os.path.join(out_dir, f'{split_name}.bin')
+    total = 0
+    with open(out_path, 'wb') as f:
+        for row in tokenized:
+            arr = np.array(row['tokens'], dtype=np.uint16)
+            f.write(arr.tobytes())
+            total += len(arr)
+    print(f'{split_name}: {total} tokens')
 "
 
 echo "Done. Files in ${OUT_DIR}:"
