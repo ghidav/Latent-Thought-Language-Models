@@ -12,7 +12,7 @@ OUT_DIR="${DATA_DIR}/tok_gpt2"
 
 mkdir -p "$OUT_DIR"
 
-echo "Downloading pre-tokenized OpenWebText into ${OUT_DIR} ..."
+echo "Downloading pre-tokenized OpenWebText into ${OUT_DIR} (streaming) ..."
 
 python -c "
 from datasets import load_dataset
@@ -22,17 +22,29 @@ import os
 out_dir = '${OUT_DIR}'
 os.makedirs(out_dir, exist_ok=True)
 
-ds = load_dataset('anyasims/openwebtext-tokenized', split='train')
-split = ds.train_test_split(test_size=0.005, seed=42)
+ds = load_dataset('anyasims/openwebtext-tokenized', split='train', streaming=True)
 
-for split_name, key in [('train', 'train'), ('val', 'test')]:
-    total = 0
-    with open(os.path.join(out_dir, f'{split_name}.bin'), 'wb') as f:
-        for row in split[key]:
-            arr = np.array(row['tokens'], dtype=np.uint16)
-            f.write(arr.tobytes())
-            total += len(arr)
-    print(f'{split_name}: {total} tokens')
+train_f = open(os.path.join(out_dir, 'train.bin'), 'wb')
+val_f = open(os.path.join(out_dir, 'val.bin'), 'wb')
+
+train_total = 0
+val_total = 0
+
+# Use every 200th example as val (~0.5%)
+for i, row in enumerate(ds):
+    arr = np.array(row['ids'], dtype=np.uint16)
+    if i % 200 == 0:
+        val_f.write(arr.tobytes())
+        val_total += len(arr)
+    else:
+        train_f.write(arr.tobytes())
+        train_total += len(arr)
+    if i % 500000 == 0:
+        print(f'Processed {i} docs | train: {train_total} tokens, val: {val_total} tokens')
+
+train_f.close()
+val_f.close()
+print(f'Done. train: {train_total} tokens, val: {val_total} tokens')
 "
 
 echo "Done. Files in ${OUT_DIR}:"
