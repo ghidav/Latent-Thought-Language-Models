@@ -27,7 +27,7 @@ from transformers import GPT2TokenizerFast, GPT2LMHeadModel
 # -----------------------------------------------------------------------------
 
 # Base directory for caching dataset files
-DATA_CACHE_DIR = "/data_owt"
+DATA_CACHE_DIR = os.environ.get("DATA_CACHE_DIR", "/scratch_local/data_owt")
 
 # RNG seed parameters
 DEFAULT_SEED = 42
