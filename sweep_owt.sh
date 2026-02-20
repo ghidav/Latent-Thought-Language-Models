@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=ltm_sweep
-#SBATCH --partition=ulow
+#SBATCH --partition=only-one-gpu
 #SBATCH --account=d.ghilardi
+#SBATCH --qos=only-one-gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
-#SBATCH --time=14-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --output=sweep_owt_%j.log
 
 set -euo pipefail
